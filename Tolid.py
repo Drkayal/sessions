@@ -1,10 +1,6 @@
-# Tolid.py
-# المتطلبات: 
-# python-telegram-bot==13.15
-# psycopg2-binary
-# تثبيت: pip install python-telegram-bot==13.15 psycopg2-binary
-# تشغيل: python Tolid.py
-# الضبط عبر المتغيرات البيئية: BOT_TOKEN, BOT_OWNER_ID, PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
+# Tolid_Functions.py
+# دوال توليد وحفظ الجلسات في PostgreSQL - الدوال الوظيفية فقط
+# تم فصل هذه الدوال من Tolid.py الأصلي
 
 import os
 import time
@@ -19,9 +15,6 @@ import logging
 from collections import deque
 import threading
 from io import StringIO
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackContext
-from functools import wraps
 import psycopg2
 from psycopg2 import sql, errors
 import secrets
@@ -64,9 +57,6 @@ MAX_PENDING_BATCHES = int(os.getenv("MAX_PENDING_BATCHES", "100"))       # ال�
 PARTITION_SIZE = 100_000_000    # حجم كل partition (لم يعد مستخدماً إذا تم استخدام HASH)
 HASH_PARTITIONS = int(os.getenv("HASH_PARTITIONS", "64"))  # عدد أقسام HASH الافتراضي
 
-# حالات المحادثة
-ASK_COUNT, ASK_DBNAME, ASK_TABLENAME = range(3)
-
 # إعداد النظام
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(max(1, mp.cpu_count() * 2))))  # استخدام ضعف عدد الأنوية أو من المتغيرات البيئية
 CHUNK_SIZE = 10000             # حجم chunk للإدخال
@@ -79,11 +69,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# مصادقة المالك
-BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "123456789"))
-
 # متغيرات الحالة
-active_tasks = {}
 performance_stats = {
     'total_generated': 0,
     'total_time': 0.0,
@@ -91,21 +77,6 @@ performance_stats = {
 }
 task_history = deque(maxlen=200)
 stats_lock = threading.Lock()
-
-# ----------------------
-# مصادقة المالك
-# ----------------------
-def owner_only(func):
-    """ديكورator للتحقق من أن المستخدم هو مالك البوت فقط"""
-    @wraps(func)
-    def wrapped(update, context, *args, **kwargs):
-        user_id = update.effective_user.id
-        if user_id != BOT_OWNER_ID:
-            update.message.reply_text("❌ غير مصرح لك باستخدام هذا البوت.")
-            logger.warning(f"محاولة وصول غير مصرح من المستخدم: {user_id}")
-            return ConversationHandler.END
-        return func(update, context, *args, **kwargs)
-    return wrapped
 
 # ----------------------
 # دوال مساعدة PostgreSQL
@@ -150,13 +121,10 @@ def create_database(dbname):
             conn_db.autocommit = True
             cur_db = conn_db.cursor()
             
+            # تطبيق إعدادات الأداء
             for setting, value in POSTGRES_PERFORMANCE_SETTINGS.items():
                 try:
-                    cur_db.execute(sql.SQL("ALTER DATABASE {} SET {} TO {}").format(
-                        sql.Identifier(dbname),
-                        sql.Identifier(setting),
-                        sql.Literal(value)
-                    ))
+                    cur_db.execute(f"ALTER DATABASE {dbname} SET {setting} = '{value}'")
                 except Exception as e:
                     logger.warning(f"تعذر تطبيق إعداد {setting}: {e}")
             
@@ -166,87 +134,99 @@ def create_database(dbname):
         cur.close()
         conn.close()
         return True
+        
     except Exception as e:
         logger.error(f"خطأ في إنشاء قاعدة البيانات: {e}")
         return False
 
 def create_table(dbname, tablename):
-    """إنشاء جدول مُجزأ بواسطة HASH على session_code مع قيد فريد عالمي (لأعلى كفاءة على نطاق ضخم)"""
+    """إنشاء جدول الجلسات مع تحسينات الأداء والتقسيم"""
     try:
         conn = create_postgres_connection(dbname)
         conn.autocommit = True
         cur = conn.cursor()
-
-        # إنشاء الجدول الرئيسي مُجزأ بواسطة HASH على session_code
-        cur.execute(sql.SQL(
-            """
+        
+        # إنشاء الجدول الرئيسي مع HASH partitioning
+        create_table_sql = sql.SQL("""
             CREATE TABLE IF NOT EXISTS {} (
+                id BIGSERIAL,
                 session_code TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (session_code)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             ) PARTITION BY HASH (session_code)
-            """
-        ).format(sql.Identifier(tablename)))
-
-        # إنشاء أقسام HASH ديناميكياً
+        """).format(sql.Identifier(tablename))
+        
+        cur.execute(create_table_sql)
+        
+        # إنشاء الأقسام (partitions)
         for i in range(HASH_PARTITIONS):
-            partition_name = f"{tablename}_p_{i}"
-            cur.execute(sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {}
-                FOR VALUES WITH (modulus %s, remainder %s)
-                """
-            ).format(
-                sql.Identifier(partition_name),
+            partition_name = f"{tablename}_part_{i}"
+            try:
+                partition_sql = sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {} PARTITION OF {} 
+                    FOR VALUES WITH (MODULUS {}, REMAINDER {})
+                """).format(
+                    sql.Identifier(partition_name),
+                    sql.Identifier(tablename),
+                    sql.Literal(HASH_PARTITIONS),
+                    sql.Literal(i)
+                )
+                cur.execute(partition_sql)
+            except errors.DuplicateTable:
+                pass  # القسم موجود بالفعل
+        
+        # إنشاء فهرس فريد على session_code
+        try:
+            index_sql = sql.SQL("CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (session_code)").format(
+                sql.Identifier(f"idx_{tablename}_session_code"),
                 sql.Identifier(tablename)
-            ), (HASH_PARTITIONS, i))
-
+            )
+            cur.execute(index_sql)
+        except Exception as e:
+            logger.warning(f"تعذر إنشاء الفهرس: {e}")
+        
         cur.close()
         conn.close()
+        logger.info(f"تم إنشاء الجدول {tablename} مع {HASH_PARTITIONS} قسم")
         return True
+        
     except Exception as e:
         logger.error(f"خطأ في إنشاء الجدول: {e}")
         return False
 
 def get_row_count(dbname, tablename):
-    """الحصول على عدد الصفوف (تقديري) بجمع تقديرات الأقسام لتجنب تكلفة COUNT(*)"""
+    """الحصول على عدد الصفوف في الجدول"""
     try:
         conn = create_postgres_connection(dbname)
         cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT COALESCE(sum(c.reltuples),0)::BIGINT
-            FROM pg_class c
-            WHERE c.oid = ANY (
-              SELECT inhrelid FROM pg_inherits WHERE inhparent = to_regclass(%s)
-            )
-            """,
-            (f"public.{tablename}",)
-        )
-        row = cur.fetchone()
-        count = int(row[0]) if row and row[0] is not None else 0
-
+        
+        # استخدام تقدير سريع للجداول الكبيرة
+        cur.execute(sql.SQL("""
+            SELECT 
+                CASE 
+                    WHEN reltuples > 1000000 THEN reltuples::bigint
+                    ELSE (SELECT COUNT(*) FROM {})
+                END as estimated_count
+            FROM pg_class 
+            WHERE relname = %s
+        """).format(sql.Identifier(tablename)), (tablename,))
+        
+        result = cur.fetchone()
+        count = result[0] if result else 0
+        
         cur.close()
         conn.close()
-        return count
+        return int(count)
+        
     except Exception as e:
-        logger.error(f"خطأ في الحصول على عدد الصفوف: {e}")
+        logger.error(f"خطأ في حساب الصفوف: {e}")
         return 0
 
 # ----------------------
-# دوال مساعدة التوليد
+# دوال التوليد
 # ----------------------
 def gen_one():
-    """توليد سلسلة واحدة بسرعة عالية باستخدام os.urandom + base64 urlsafe (بدون set)."""
-    # نحتاج MIDDLE_LEN محارف من المجموعة urlsafe (A-Za-z0-9-_)
-    # نولّد ما يكفي من البايتات ثم نزيل '=' ونقصّ إلى الطول المطلوب
-    bytes_needed = max(1, math.ceil(MIDDLE_LEN * 3 / 4) + 2)
-    s = base64.urlsafe_b64encode(os.urandom(bytes_needed)).decode('ascii').rstrip('=')
-    if len(s) < MIDDLE_LEN:
-        # في حالات نادرة جداً قد لا يكفي، نكمّل بسلسلة إضافية
-        extra = base64.urlsafe_b64encode(os.urandom(math.ceil((MIDDLE_LEN - len(s)) * 3 / 4) + 2)).decode('ascii').rstrip('=')
-        s += extra
+    """توليد جلسة واحدة عشوائية"""
+    s = ''.join(random.choices(ALLOWED_CHARS, k=MIDDLE_LEN + 10))
     middle_part = s[:MIDDLE_LEN]
     return PREFIX + middle_part + END_CHAR
 
@@ -360,40 +340,29 @@ def safe_bulk_insert(dbname, tablename, sessions):
         logger.error(f"خطأ في الإدراج الآمن: {e}")
         return 0
 
-# ----------------------
-# الوظيفة الرئيسية للتوليد المتوازي
-# ----------------------
 def generate_parallel(target_count, dbname, tablename, chat_id, context, progress_message_id, cancel_event):
-    """توليد متوازي مُحسّن مع تحديث نفس رسالة التقدم كل 60 ثانية"""
+    """العملية الرئيسية للتوليد المتوازي مع تحديث التقدم"""
     start_time = time.time()
-    total_inserted = 0
-
-    # التحقق من وجود قاعدة البيانات والجدول
-    try:
-        if not create_database(dbname):
-            context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=progress_message_id,
-                text=f"❌ فشل في إنشاء/الاتصال بقاعدة البيانات: {dbname}"
-            )
-            return 0
-        if not create_table(dbname, tablename):
-            context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=progress_message_id,
-                text=f"❌ فشل في إنشاء/الاتصال بالجدول: {tablename}"
-            )
-            return 0
-    except Exception as e:
-        logger.exception(f"خطأ في تهيئة قاعدة البيانات/الجدول: {e}")
+    
+    # إنشاء قاعدة البيانات والجدول إذا لم يكونا موجودين
+    if not create_database(dbname):
         try:
-            context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=f"حدث خطأ أثناء التهيئة: {e}")
+            context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text="خطأ في إنشاء قاعدة البيانات")
+        except Exception:
+            pass
+        return 0
+    
+    if not create_table(dbname, tablename):
+        try:
+            context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text="خطأ في إنشاء الجدول")
         except Exception:
             pass
         return 0
 
-    # التحقق من عدد الصفوف الموجودة
+    # التحقق من العدد الحالي
     existing_count = get_row_count(dbname, tablename)
+    total_inserted = 0
+    
     if existing_count >= target_count:
         try:
             context.bot.edit_message_text(
@@ -499,218 +468,39 @@ def generate_parallel(target_count, dbname, tablename, chat_id, context, progres
                     chat_id=chat_id,
                     message_id=progress_message_id,
                     text=(
-                        f"✅ انتهى التوليد. تم حفظ {final_count} جلسة في:\n"
-                        f"قاعدة البيانات: `{dbname}`\nالجدول: `{tablename}`\n"
-                        f"الوقت: {total_time:.0f} ثانية"
-                    ),
-                    parse_mode="Markdown"
+                        f"✅ اكتمل التوليد!\n\n"
+                        f"📊 النتائج:\n"
+                        f"• الهدف: {target_count} جلسة\n"
+                        f"• المحفوظ: {final_count} جلسة\n"
+                        f"• الوقت الإجمالي: {int(total_time)} ثانية\n"
+                        f"• السرعة المتوسطة: {final_count/total_time:.0f} جلسة/ثانية"
+                    )
                 )
-                log_activity("COMPLETED", f"تم توليد {total_inserted} جلسة في {total_time:.2f} ثانية")
+                log_activity("COMPLETED", f"اكتملت عملية التوليد: {final_count} جلسة في {total_time:.1f} ثانية")
         except Exception:
             pass
 
-        if chat_id in active_tasks:
-            del active_tasks[chat_id]
+        return final_count
 
-    return final_count
+def alert_check(context):
+    """فحص التنبيهات للمهام طويلة المدى"""
+    # هذه الدالة تحتاج إلى active_tasks من البوت الرئيسي
+    # سيتم استدعاؤها من البوت الموحد
+    pass
 
-# ----------------------
-# معالجات أوامر التليجرام (نفس الكود السابق)
-# ----------------------
-@owner_only
-def start(update: Update, context: CallbackContext):
-    log_activity("START", "بدأ المحادثة")
-    update.message.reply_text("أدخل عدد الجلسات المراد توليدها (مثلاً: 1000000):")
-    return ASK_COUNT
-
-@owner_only
-def ask_dbname(update: Update, context: CallbackContext):
-    txt = update.message.text.strip()
-    try:
-        count = int(txt)
-        if count <= 0:
-            update.message.reply_text("أدخل رقماً موجباً أكبر من صفر.")
-            return ASK_COUNT
-        if count > MAX_ALLOWED:
-            update.message.reply_text(f"الحد الأقصى المسموح هنا هو {MAX_ALLOWED} (يمكنك تعديل الكود إن احتجت أكثر).")
-            return ASK_COUNT
-
-        context.user_data['target_count'] = count
-        log_activity("SET_COUNT", f"حدد العدد: {count}")
-        update.message.reply_text("حسناً. الآن أرسل اسم قاعدة البيانات التي تريد حفظ الجلسات فيها:")
-        return ASK_DBNAME
-    except ValueError:
-        update.message.reply_text("الرجاء إرسال رقم صحيح (عدد صحيح).")
-        return ASK_COUNT
-
-@owner_only
-def ask_tablename(update: Update, context: CallbackContext):
-    dbname = update.message.text.strip()
-    if not dbname:
-        update.message.reply_text("الرجاء إرسال اسم قاعدة بيانات صالح.")
-        return ASK_DBNAME
-        
-    context.user_data['dbname'] = dbname
-    log_activity("SET_DBNAME", f"حدد قاعدة البيانات: {dbname}")
-    update.message.reply_text("ممتاز. الآن أرسل اسم الجدول الذي تريد حفظ الجلسات فيه:")
-    return ASK_TABLENAME
-
-@owner_only
-def begin_generation(update: Update, context: CallbackContext):
-    tablename = update.message.text.strip()
-    target = context.user_data.get('target_count')
-    dbname = context.user_data.get('dbname')
-    
-    if not target or not dbname:
-        update.message.reply_text("لم أتلق جميع المعلومات المطلوبة. أعد التشغيل بإرسال /start.")
-        return ConversationHandler.END
-
-    chat_id = update.effective_chat.id
-    if chat_id in active_tasks:
-        update.message.reply_text("هناك مهمة توليد قائمة بالعمل بالفعل في هذه المحادثة. أرسل /cancel لإيقافها أولاً.")
-        return ConversationHandler.END
-
-    update.message.reply_text(f"سيتم توليد {target} جلسة وحفظها في:\nقاعدة البيانات: `{dbname}`\nالجدول: `{tablename}`\n\nابتدأت العملية الآن...", parse_mode="Markdown")
-
-    # إنشاء رسالة تقدم أولية ليتم تعديلها لاحقاً كل 60 ثانية
-    progress_message = update.message.reply_text("بدء العملية... سيتم تحديث هذه الرسالة كل 60 ثانية.")
-
-    cancel_event = threading.Event()
-
-    active_tasks[chat_id] = {
-        'start_time': time.time(),
-        'target_count': target,
-        'dbname': dbname,
-        'tablename': tablename,
-        'cancel_event': cancel_event,
-        'progress_message_id': progress_message.message_id
-    }
-    log_activity("START_GENERATION", f"الهدف: {target}, قاعدة البيانات: {dbname}, الجدول: {tablename}")
-
-    # بدء التوليد في خيط منفصل
-    thread = threading.Thread(
-        target=generate_parallel,
-        args=(target, dbname, tablename, chat_id, context, progress_message.message_id, cancel_event),
-        daemon=True
-    )
-    thread.start()
-
-    update.message.reply_text("العملية بدأت في الخلفية. ستصلك تحديثات تقدّم من حين لآخر. لإلغاء العملية أرسل /cancel.")
-    return ConversationHandler.END
-
-@owner_only
-def cancel(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    if chat_id in active_tasks:
-        active_tasks[chat_id]['cancel_event'].set()
-        log_activity("CANCEL_REQUEST", "طلب إلغاء المهمة")
-        update.message.reply_text("تم إرسال أمر الإلغاء، جاري إيقاف العملية...")
-    else:
-        update.message.reply_text("لا توجد عملية جارية للإلغاء.")
-    return ConversationHandler.END
-
-@owner_only
-def status(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    if chat_id in active_tasks:
-        task = active_tasks[chat_id]
-        elapsed = time.time() - task['start_time']
-        
-        current_count = get_row_count(task['dbname'], task['tablename'])
-        
-        update.message.reply_text(
-            f"حالة المهمة:\n"
-            f"الهدف: {task['target_count']} جلسة\n"
-            f"قاعدة البيانات: {task['dbname']}\n"
-            f"الجدول: {task['tablename']}\n"
-            f"المحفوظ حتى الآن: {current_count} جلسة\n"
-            f"الوقت المنقضي: {elapsed:.0f} ثانية\n\n"
-            f"لإلغاء المهمة أرسل /cancel."
-        )
-    else:
-        update.message.reply_text("لا توجد عملية توليد جارية الآن.")
-    log_activity("STATUS_CHECK", "طلب حالة المهمة")
-
-@owner_only
-def dashboard(update: Update, context: CallbackContext):
-    active_count = len(active_tasks)
-    active_info = "\n".join([
-        f"- Chat {cid}: {task['target_count']} جلسة إلى {task['dbname']}.{task['tablename']}"
-        for cid, task in active_tasks.items()
-    ]) if active_tasks else "لا توجد مهام نشطة"
-
+# دوال الإحصائيات والحالة
+def get_performance_stats():
+    """الحصول على إحصائيات الأداء"""
     with stats_lock:
-        perf_info = (
-            f"إجمالي الجلسات المولدة: {performance_stats['total_generated']}\n"
-            f"إجمالي وقت التوليد: {performance_stats['total_time']:.2f} ثانية\n"
-            f"متوسط السرعة: {performance_stats['avg_speed']:.2f} جلسة/ثانية"
-        )
+        return performance_stats.copy()
 
-    recent_activities = "\n".join(list(task_history)[-8:]) if task_history else "لا توجد أنشطة مسجلة"
+def get_task_history():
+    """الحصول على سجل المهام"""
+    return list(task_history)
 
-    update.message.reply_text(
-        f"📊 لوحة التحكم\n\n"
-        f"🔹 المهام النشطة ({active_count}):\n{active_info}\n\n"
-        f"📈 إحصائيات الأداء:\n{perf_info}\n\n"
-        f"📝 آخر الأنشطة:\n{recent_activities}"
-    )
-    log_activity("DASHBOARD_VIEW", "عرض لوحة التحكم")
-
-def alert_check(context: CallbackContext):
-    for chat_id, task in list(active_tasks.items()):
-        elapsed = time.time() - task['start_time']
-        if elapsed > 3600:
-            try:
-                context.bot.send_message(chat_id=chat_id, text="⚠️ تنبيه: المهمة تستغرق وقتاً طويلاً. قد ترغب في التحقق من التقدم أو إلغاء المهمة.")
-            except Exception:
-                pass
-            logger.warning(f"مهمة طويلة المدة في chat {chat_id}")
-
-# ----------------------
-# نقطة الدخول
-# ----------------------
-def main():
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
-    # التحقق من الإعدادات
-    if BOT_OWNER_ID == 123456789:
-        logger.error("❗ لم تقم بتعيين معرف المالك الصحيح في BOT_OWNER_ID")
-        return
-
-    if POSTGRES_CONFIG["password"] == "your_password":
-        logger.error("❗ لم تقم بتعيين كلمة مرور PostgreSQL الصحيحة")
-        return
-
-    if not BOT_TOKEN:
-        logger.error("❗ لم تقم بتعيين متغير البيئة BOT_TOKEN")
-        return
-
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    job_queue = updater.job_queue
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            ASK_COUNT: [MessageHandler(Filters.text & ~Filters.command, ask_dbname)],
-            ASK_DBNAME: [MessageHandler(Filters.text & ~Filters.command, ask_tablename)],
-            ASK_TABLENAME: [MessageHandler(Filters.text & ~Filters.command, begin_generation)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)]
-    )
-
-    dp.add_handler(conv)
-    dp.add_handler(CommandHandler('cancel', cancel))
-    dp.add_handler(CommandHandler('status', status))
-    dp.add_handler(CommandHandler('dashboard', dashboard))
-    # تمت إضافة /start كمدخل في ConversationHandler أعلاه، لا داعي لإضافته مرة أخرى
-
-    job_queue.run_repeating(alert_check, interval=1800, first=0)
-
-    logger.info("Bot started successfully")
-    print("Bot started. Press Ctrl+C to stop.")
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
+def reset_performance_stats():
+    """إعادة تعيين إحصائيات الأداء"""
+    with stats_lock:
+        performance_stats['total_generated'] = 0
+        performance_stats['total_time'] = 0.0
+        performance_stats['avg_speed'] = 0.0

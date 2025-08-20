@@ -18,17 +18,17 @@ from telegram.ext import (
 
 # استيراد الدوال الوظيفية
 try:
-    import Tolid_Functions as tolid
+    import Tolid as tolid
     TOLID_AVAILABLE = True
 except ImportError as e:
-    print(f"تحذير: لا يمكن استيراد Tolid_Functions: {e}")
+    print(f"تحذير: لا يمكن استيراد Tolid: {e}")
     TOLID_AVAILABLE = False
 
 try:
-    import SessionChecker_Functions as checker
+    import SessionChecker as checker
     CHECKER_AVAILABLE = True
 except ImportError as e:
-    print(f"تحذير: لا يمكن استيراد SessionChecker_Functions: {e}")
+    print(f"تحذير: لا يمكن استيراد SessionChecker: {e}")
     CHECKER_AVAILABLE = False
 
 # ----------------------
