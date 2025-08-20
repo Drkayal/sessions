@@ -401,12 +401,15 @@ def start_session_checking(query, context, session_type):
         'progress_message_id': progress_message.message_id
     }
     
+    # دالة للتنظيف بعد انتهاء المهمة
+    def cleanup_check_task():
+        checker.session_generation_and_check_process(session_type, chat_id, context, progress_message.message_id, cancel_event)
+        # إزالة المهمة من القائمة النشطة
+        if chat_id in active_tasks:
+            del active_tasks[chat_id]
+    
     # بدء عملية التوليد والفحص في خيط منفصل
-    thread = threading.Thread(
-        target=checker.session_generation_and_check_process,
-        args=(session_type, chat_id, context, progress_message.message_id, cancel_event),
-        daemon=True
-    )
+    thread = threading.Thread(target=cleanup_check_task, daemon=True)
     thread.start()
     
     checker.log_activity("START_UNIFIED_CHECKING", f"بدء فحص جلسات {session_type}")
@@ -495,12 +498,16 @@ def handle_tablename_input(update: Update, context: CallbackContext):
         'progress_message_id': progress_message.message_id
     }
     
+    # دالة للتنظيف بعد انتهاء المهمة
+    def cleanup_task():
+        result = tolid.generate_parallel(target_count, dbname, tablename, chat_id, context, progress_message.message_id, cancel_event)
+        # إزالة المهمة من القائمة النشطة
+        if chat_id in active_tasks:
+            del active_tasks[chat_id]
+        return result
+    
     # بدء التوليد في خيط منفصل
-    thread = threading.Thread(
-        target=tolid.generate_parallel,
-        args=(target_count, dbname, tablename, chat_id, context, progress_message.message_id, cancel_event),
-        daemon=True
-    )
+    thread = threading.Thread(target=cleanup_task, daemon=True)
     thread.start()
     
     tolid.log_activity("START_UNIFIED_GENERATION", f"الهدف: {target_count}, قاعدة البيانات: {dbname}, الجدول: {tablename}")
