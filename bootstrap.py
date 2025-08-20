@@ -33,6 +33,15 @@ def ensure_packages() -> None:
         print("[bootstrap] فشل تثبيت المتطلبات عبر pip", file=sys.stderr)
         sys.exit(1)
 
+    # تحقق صريح من أن الوحدات أصبحت متاحة
+    try:
+        import telegram  # noqa: F401
+        import psycopg2  # noqa: F401
+        print("[bootstrap] تم تثبيت الحزم والتحقق من توفرها بنجاح")
+    except Exception as e:
+        print(f"[bootstrap] تم تثبيت الحزم لكن التحقق من الاستيراد فشل: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 def verify_env() -> None:
     bot_token = os.getenv("BOT_TOKEN", "")
@@ -76,6 +85,7 @@ def ensure_database() -> None:
             print(f"[bootstrap] قاعدة البيانات موجودة مسبقاً: {target_db}")
         cur.close()
         conn.close()
+        print("[bootstrap] اكتملت خطوة التحقق/الإنشاء لقاعدة البيانات")
     except Exception as e:
         print(f"[bootstrap] تعذر إنشاء/التحقق من قاعدة البيانات '{target_db}': {e}", file=sys.stderr)
         # لا نُنهِي البرنامج، قد يتكفل التطبيق لاحقاً بإنشائها أو تكون صلاحيات محدودة
