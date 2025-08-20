@@ -10,6 +10,8 @@ import os
 import time
 import random
 import string
+import math
+import base64
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
@@ -56,16 +58,17 @@ TOTAL_LENGTH = 344              # طول السلسلة المطلوب بالك�
 END_CHAR = "="                  # يجب أن تنتهي به
 MIDDLE_LEN = TOTAL_LENGTH - len(PREFIX) - len(END_CHAR)  # طول الجزء العشوائي
 ALLOWED_CHARS = string.ascii_letters + string.digits + "-_"  # مجموعة الأحرف المستخدمة
-DEFAULT_BATCH = 50000           # حجم الدفعة الافتراضي (أكبر لتحسين الأداء)
+DEFAULT_BATCH = int(os.getenv("DEFAULT_BATCH", "50000"))           # حجم الدفعة الافتراضي (قابل للتهيئة)
 MAX_ALLOWED = 10_000_000_000    # حد أقصى 10 مليار سجل
-MAX_PENDING_BATCHES = 100       # زيادة الحد الأقصى للدفعات المعلقة
-PARTITION_SIZE = 100_000_000    # حجم كل partition (100 مليون سجل)
+MAX_PENDING_BATCHES = int(os.getenv("MAX_PENDING_BATCHES", "100"))       # الحد الأقصى للدفعات المعلقة (قابل للتهيئة)
+PARTITION_SIZE = 100_000_000    # حجم كل partition (لم يعد مستخدماً إذا تم استخدام HASH)
+HASH_PARTITIONS = int(os.getenv("HASH_PARTITIONS", "64"))  # عدد أقسام HASH الافتراضي
 
 # حالات المحادثة
 ASK_COUNT, ASK_DBNAME, ASK_TABLENAME = range(3)
 
 # إعداد النظام
-MAX_WORKERS = max(1, mp.cpu_count() * 2)  # استخدام ضعف عدد الأنوية
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(max(1, mp.cpu_count() * 2))))  # استخدام ضعف عدد الأنوية أو من المتغيرات البيئية
 CHUNK_SIZE = 10000             # حجم chunk للإدخال
 
 # إعداد التسجيل
@@ -168,24 +171,36 @@ def create_database(dbname):
         return False
 
 def create_table(dbname, tablename):
-    """إنشاء جدول بسيط مع قيود فريدة مناسبة (بدون تجزئة)"""
+    """إنشاء جدول مُجزأ بواسطة HASH على session_code مع قيد فريد عالمي (لأعلى كفاءة على نطاق ضخم)"""
     try:
         conn = create_postgres_connection(dbname)
+        conn.autocommit = True
         cur = conn.cursor()
 
-        # إنشاء جدول عادي مع مفتاح أساسي على id وقيد فريد على session_code
+        # إنشاء الجدول الرئيسي مُجزأ بواسطة HASH على session_code
         cur.execute(sql.SQL(
             """
             CREATE TABLE IF NOT EXISTS {} (
-                id BIGSERIAL PRIMARY KEY,
-                session_code TEXT NOT NULL UNIQUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+                session_code TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_code)
+            ) PARTITION BY HASH (session_code)
             """
         ).format(sql.Identifier(tablename)))
 
-        # فهرس إضافي اختياري على session_code غير ضروري لأن UNIQUE ينشئ فهرساً ضمنياً
-        conn.commit()
+        # إنشاء أقسام HASH ديناميكياً
+        for i in range(HASH_PARTITIONS):
+            partition_name = f"{tablename}_p_{i}"
+            cur.execute(sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {} PARTITION OF {}
+                FOR VALUES WITH (modulus %s, remainder %s)
+                """
+            ).format(
+                sql.Identifier(partition_name),
+                sql.Identifier(tablename)
+            ), (HASH_PARTITIONS, i))
+
         cur.close()
         conn.close()
         return True
@@ -194,14 +209,19 @@ def create_table(dbname, tablename):
         return False
 
 def get_row_count(dbname, tablename):
-    """الحصول على عدد الصفوف (تقديري) لتجنب تكلفة COUNT(*) على جداول ضخمة"""
+    """الحصول على عدد الصفوف (تقديري) بجمع تقديرات الأقسام لتجنب تكلفة COUNT(*)"""
     try:
         conn = create_postgres_connection(dbname)
         cur = conn.cursor()
 
-        # استخدام تقدير reltuples من pg_class
         cur.execute(
-            "SELECT COALESCE(reltuples, 0)::BIGINT FROM pg_class WHERE oid = to_regclass(%s)",
+            """
+            SELECT COALESCE(sum(c.reltuples),0)::BIGINT
+            FROM pg_class c
+            WHERE c.oid = ANY (
+              SELECT inhrelid FROM pg_inherits WHERE inhparent = to_regclass(%s)
+            )
+            """,
             (f"public.{tablename}",)
         )
         row = cur.fetchone()
@@ -218,19 +238,21 @@ def get_row_count(dbname, tablename):
 # دوال مساعدة التوليد
 # ----------------------
 def gen_one():
-    """مولد لسلسلة واحدة باستخدام secrets للأمان القوي"""
-    middle_part = ''.join(secrets.choice(ALLOWED_CHARS) for _ in range(MIDDLE_LEN))
+    """توليد سلسلة واحدة بسرعة عالية باستخدام os.urandom + base64 urlsafe (بدون set)."""
+    # نحتاج MIDDLE_LEN محارف من المجموعة urlsafe (A-Za-z0-9-_)
+    # نولّد ما يكفي من البايتات ثم نزيل '=' ونقصّ إلى الطول المطلوب
+    bytes_needed = max(1, math.ceil(MIDDLE_LEN * 3 / 4) + 2)
+    s = base64.urlsafe_b64encode(os.urandom(bytes_needed)).decode('ascii').rstrip('=')
+    if len(s) < MIDDLE_LEN:
+        # في حالات نادرة جداً قد لا يكفي، نكمّل بسلسلة إضافية
+        extra = base64.urlsafe_b64encode(os.urandom(math.ceil((MIDDLE_LEN - len(s)) * 3 / 4) + 2)).decode('ascii').rstrip('=')
+        s += extra
+    middle_part = s[:MIDDLE_LEN]
     return PREFIX + middle_part + END_CHAR
 
 def generate_batch(batch_size):
-    """توليد دفعة من السلاسل باستخدام مولد أكثر كفاءة"""
-    generated = set()
-    while len(generated) < batch_size:
-        # استخدام تقنية أكثر كفاءة لتجنب التكرار
-        session = gen_one()
-        if session not in generated:
-            generated.add(session)
-    return list(generated)
+    """توليد دفعة من السلاسل بسرعة عالية دون فحص تكرار محلي (الاعتماد على UNIQUE في القاعدة)."""
+    return [gen_one() for _ in range(batch_size)]
 
 def progress_bar(percentage, length=20):
     """إنشاء شريط تقدم نصي"""
