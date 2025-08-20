@@ -23,6 +23,7 @@ import hashlib
 try:
     from telethon import TelegramClient
     from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, ApiIdInvalidError
+    from telethon.sessions import StringSession
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
@@ -55,6 +56,10 @@ ALLOWED_CHARS = string.ascii_letters + string.digits + "-_"
 DEFAULT_BATCH = int(os.getenv("DEFAULT_BATCH", "100"))  # دفعات أصغر للفحص
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", str(max(1, mp.cpu_count()))))
 CHUNK_SIZE = 50  # حجم أصغر للفحص
+
+# إعدادات API لتيليجرام (قابلة للتهيئة من البيئة)
+API_ID = int(os.getenv("API_ID", os.getenv("TELEGRAM_API_ID", "6")))
+API_HASH = os.getenv("API_HASH", os.getenv("TELEGRAM_API_HASH", "eb06d4abfb49dc3eeb1aeb98ae0f581e"))
 
 # إعداد التسجيل
 logging.basicConfig(
@@ -109,11 +114,8 @@ async def check_telethon_session(session_string: str, bot_token: str) -> bool:
         return False
     
     try:
-        # استخدام API ID وهمي للفحص السريع
-        api_id = 6  # API ID تجريبي
-        api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"  # API Hash تجريبي
-        
-        client = TelegramClient(StringIO(session_string), api_id, api_hash)
+        # استخدام StringSession مع API_ID/API_HASH القابلة للتهيئة
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.connect()
         
         if await client.is_user_authorized():
@@ -133,11 +135,8 @@ async def check_pyrogram_session(session_string: str, bot_token: str) -> bool:
         return False
     
     try:
-        # استخدام API ID وهمي للفحص السريع
-        api_id = 6
-        api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
-        
-        client = Client("temp_session", api_id, api_hash, session_string=session_string)
+        # استخدام API_ID/API_HASH القابلة للتهيئة
+        client = Client("temp_session", API_ID, API_HASH, session_string=session_string)
         await client.start()
         
         if await client.get_me():
@@ -153,22 +152,23 @@ async def check_pyrogram_session(session_string: str, bot_token: str) -> bool:
 
 def check_session_sync(session_string: str, session_type: str, bot_token: str) -> bool:
     """دالة متزامنة لفحص الجلسة"""
+    loop = asyncio.new_event_loop()
     try:
-        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
         if session_type == "telethon":
-            result = loop.run_until_complete(check_telethon_session(session_string, bot_token))
+            return loop.run_until_complete(check_telethon_session(session_string, bot_token))
         elif session_type == "pyrogram":
-            result = loop.run_until_complete(check_pyrogram_session(session_string, bot_token))
+            return loop.run_until_complete(check_pyrogram_session(session_string, bot_token))
         else:
-            result = False
-            
-        loop.close()
-        return result
+            return False
     except Exception as e:
         logger.error(f"خطأ في فحص الجلسة المتزامن: {e}")
         return False
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 # ----------------------
 # دوال مساعدة
@@ -287,7 +287,7 @@ def session_generation_and_check_process(session_type: str, chat_id: int, contex
     last_report_time = time.time()
     
     try:
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(checking_bots) if checking_bots else 1)) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             while not cancel_event.is_set():
                 # توليد دفعة جديدة
                 batch = generate_session_batch(session_type, DEFAULT_BATCH)
@@ -303,14 +303,8 @@ def session_generation_and_check_process(session_type: str, chat_id: int, contex
                     if is_session_checked(session):
                         continue
                     
-                    # الحصول على بوت فحص متاح
-                    bot_token = get_available_bot()
-                    if not bot_token:
-                        logger.warning("لا توجد بوتات فحص متاحة")
-                        time.sleep(1)
-                        continue
-                    
-                    future = executor.submit(check_session_sync, session, session_type, bot_token)
+                    # فحص الجلسة مباشرة (لا يعتمد على وجود بوتات فحص)
+                    future = executor.submit(check_session_sync, session, session_type, "")
                     futures.append((future, session))
                 
                 # معالجة النتائج
@@ -449,17 +443,18 @@ def check_file_sessions(file_path: str, chat_id: int, context):
             if is_session_checked(session):
                 continue
             
-            # تحديد نوع الجلسة
-            session_type = "telethon" if session.startswith(TELETHON_PREFIX) else "pyrogram"
+            # تحديد نوع الجلسة بشكل أدق
+            if session.startswith(TELETHON_PREFIX):
+                session_type = "telethon"
+            elif session.startswith(PYROGRAM_PREFIX):
+                session_type = "pyrogram"
+            else:
+                # نوع غير معروف
+                invalid_sessions += 1
+                continue
             
-            # الحصول على بوت فحص
-            bot_token = get_available_bot()
-            if not bot_token:
-                context.bot.send_message(chat_id, "⚠️ لا توجد بوتات فحص متاحة")
-                break
-            
-            # فحص الجلسة
-            is_valid = check_session_sync(session, session_type, bot_token)
+            # فحص الجلسة (بدون الاعتماد على بوتات الفحص)
+            is_valid = check_session_sync(session, session_type, "")
             
             if is_valid:
                 valid_sessions += 1
