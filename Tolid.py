@@ -3,8 +3,8 @@
 # python-telegram-bot==13.15
 # psycopg2-binary
 # تثبيت: pip install python-telegram-bot==13.15 psycopg2-binary
-# تشغيل: python Tolud.py
-# ثم ضع توكن البوت مكان BOT_TOKEN في الأسفل.
+# تشغيل: python Tolid.py
+# الضبط عبر المتغيرات البيئية: BOT_TOKEN, BOT_OWNER_ID, PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
 
 import os
 import time
@@ -28,11 +28,11 @@ import secrets
 # إعدادات PostgreSQL
 # ----------------------
 POSTGRES_CONFIG = {
-    "host": "localhost",
-    "port": "5432",
-    "user": "postgres",
-    "password": "your_password",
-    "database": "postgres"
+    "host": os.getenv("PGHOST", "localhost"),
+    "port": os.getenv("PGPORT", "5432"),
+    "user": os.getenv("PGUSER", "postgres"),
+    "password": os.getenv("PGPASSWORD", "your_password"),
+    "database": os.getenv("PGDATABASE", "postgres")
 }
 
 # تحسين أداء PostgreSQL
@@ -77,7 +77,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # مصادقة المالك
-BOT_OWNER_ID = 123456789
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "123456789"))
 
 # متغيرات الحالة
 active_tasks = {}
@@ -152,7 +152,7 @@ def create_database(dbname):
                     cur_db.execute(sql.SQL("ALTER DATABASE {} SET {} TO {}").format(
                         sql.Identifier(dbname),
                         sql.Identifier(setting),
-                        sql.SQL(value)
+                        sql.Literal(value)
                     ))
                 except Exception as e:
                     logger.warning(f"تعذر تطبيق إعداد {setting}: {e}")
@@ -168,52 +168,23 @@ def create_database(dbname):
         return False
 
 def create_table(dbname, tablename):
-    """إنشاء جدول مع partitioning وفهارس متقدمة"""
+    """إنشاء جدول بسيط مع قيود فريدة مناسبة (بدون تجزئة)"""
     try:
         conn = create_postgres_connection(dbname)
         cur = conn.cursor()
-        
-        # إنشاء الجدول الرئيسي
-        cur.execute(sql.SQL("""
+
+        # إنشاء جدول عادي مع مفتاح أساسي على id وقيد فريد على session_code
+        cur.execute(sql.SQL(
+            """
             CREATE TABLE IF NOT EXISTS {} (
-                id BIGSERIAL,
-                session_code TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id, session_code)
-            ) PARTITION BY RANGE (id)
-        """).format(sql.Identifier(tablename)))
-        
-        # إنشاء partitions
-        for i in range(10):  # إنشاء 10 partitions مبدئياً
-            start_id = i * PARTITION_SIZE
-            end_id = (i + 1) * PARTITION_SIZE
-            
-            partition_name = f"{tablename}_part_{i}"
-            
-            cur.execute(sql.SQL("""
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {}
-                FOR VALUES FROM (%s) TO (%s)
-            """).format(
-                sql.Identifier(partition_name),
-                sql.Identifier(tablename)
-            ), (start_id, end_id))
-            
-            # إنشاء فهرس على partition
-            cur.execute(sql.SQL("""
-                CREATE INDEX IF NOT EXISTS {} ON {} (session_code)
-            """).format(
-                sql.Identifier(f"idx_{partition_name}_session"),
-                sql.Identifier(partition_name)
-            ))
-        
-        # إنشاء فهرس فريد على الجدول الرئيسي
-        cur.execute(sql.SQL("""
-            CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} (session_code)
-        """).format(
-            sql.Identifier(f"idx_{tablename}_session_unique"),
-            sql.Identifier(tablename)
-        ))
-        
+                id BIGSERIAL PRIMARY KEY,
+                session_code TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        ).format(sql.Identifier(tablename)))
+
+        # فهرس إضافي اختياري على session_code غير ضروري لأن UNIQUE ينشئ فهرساً ضمنياً
         conn.commit()
         cur.close()
         conn.close()
@@ -223,14 +194,19 @@ def create_table(dbname, tablename):
         return False
 
 def get_row_count(dbname, tablename):
-    """الحصول على عدد الصفوف في الجدول"""
+    """الحصول على عدد الصفوف (تقديري) لتجنب تكلفة COUNT(*) على جداول ضخمة"""
     try:
         conn = create_postgres_connection(dbname)
         cur = conn.cursor()
-        
-        cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(tablename)))
-        count = cur.fetchone()[0]
-        
+
+        # استخدام تقدير reltuples من pg_class
+        cur.execute(
+            "SELECT COALESCE(reltuples, 0)::BIGINT FROM pg_class WHERE oid = to_regclass(%s)",
+            (f"public.{tablename}",)
+        )
+        row = cur.fetchone()
+        count = int(row[0]) if row and row[0] is not None else 0
+
         cur.close()
         conn.close()
         return count
@@ -269,13 +245,13 @@ def log_activity(action, details=""):
     logger.info(log_message)
     task_history.append(log_message)
 
-def monitor_performance(start_time, inserted):
-    """حساب السرعة والوقت المنقضي"""
-    elapsed = max(1e-6, time.time() - start_time)
-    speed = inserted / elapsed if elapsed > 0 else 0.0
+def monitor_performance(delta_inserted, delta_time):
+    """تحديث إحصاءات الأداء وإرجاع السرعة اللحظية خلال الفترة"""
+    elapsed = max(1e-6, delta_time)
+    speed = delta_inserted / elapsed
 
     with stats_lock:
-        performance_stats['total_generated'] += inserted
+        performance_stats['total_generated'] += delta_inserted
         performance_stats['total_time'] += elapsed
         if performance_stats['total_time'] > 0:
             performance_stats['avg_speed'] = performance_stats['total_generated'] / performance_stats['total_time']
@@ -287,6 +263,7 @@ def bulk_insert_sessions(dbname, tablename, sessions):
     if not sessions:
         return 0
     
+    conn = None
     try:
         conn = create_postgres_connection(dbname)
         cur = conn.cursor()
@@ -313,11 +290,19 @@ def bulk_insert_sessions(dbname, tablename, sessions):
         
     except errors.UniqueViolation:
         # في حالة وجود تكرار، نستخدم الإدخال مع تجاهل التكرار
-        conn.rollback()
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
         return safe_bulk_insert(dbname, tablename, sessions)
     except Exception as e:
         logger.error(f"خطأ في الإدراج الجماعي: {e}")
-        conn.rollback()
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
         return safe_bulk_insert(dbname, tablename, sessions)
 
 def safe_bulk_insert(dbname, tablename, sessions):
@@ -333,7 +318,6 @@ def safe_bulk_insert(dbname, tablename, sessions):
         inserted = 0
         for i in range(0, len(sessions), CHUNK_SIZE):
             chunk = sessions[i:i + CHUNK_SIZE]
-            placeholders = ','.join(['%s'] * len(chunk))
             
             cur.execute(
                 sql.SQL("""
@@ -357,50 +341,76 @@ def safe_bulk_insert(dbname, tablename, sessions):
 # ----------------------
 # الوظيفة الرئيسية للتوليد المتوازي
 # ----------------------
-def generate_parallel(target_count, dbname, tablename, chat_id, context):
-    """توليد متوازي مُحسّن مع إدارة ذاكرة وأداء متقدم"""
+def generate_parallel(target_count, dbname, tablename, chat_id, context, progress_message_id, cancel_event):
+    """توليد متوازي مُحسّن مع تحديث نفس رسالة التقدم كل 60 ثانية"""
     start_time = time.time()
     total_inserted = 0
 
     # التحقق من وجود قاعدة البيانات والجدول
-    if not create_database(dbname):
-        context.bot.send_message(chat_id=chat_id, text=f"❌ فشل في إنشاء/الاتصال بقاعدة البيانات: {dbname}")
-        return 0
-    
-    if not create_table(dbname, tablename):
-        context.bot.send_message(chat_id=chat_id, text=f"❌ فشل في إنشاء/الاتصال بالجدول: {tablename}")
+    try:
+        if not create_database(dbname):
+            context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_message_id,
+                text=f"❌ فشل في إنشاء/الاتصال بقاعدة البيانات: {dbname}"
+            )
+            return 0
+        if not create_table(dbname, tablename):
+            context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_message_id,
+                text=f"❌ فشل في إنشاء/الاتصال بالجدول: {tablename}"
+            )
+            return 0
+    except Exception as e:
+        logger.exception(f"خطأ في تهيئة قاعدة البيانات/الجدول: {e}")
+        try:
+            context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=f"حدث خطأ أثناء التهيئة: {e}")
+        except Exception:
+            pass
         return 0
 
     # التحقق من عدد الصفوف الموجودة
     existing_count = get_row_count(dbname, tablename)
     if existing_count >= target_count:
-        context.bot.send_message(chat_id=chat_id, text=f"الجدول يحتوي بالفعل على {existing_count} جلسة (>= المطلوب).")
+        try:
+            context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=progress_message_id,
+                text=f"الجدول يحتوي بالفعل على {existing_count} جلسة (>= المطلوب)."
+            )
+        except Exception:
+            pass
         return existing_count
 
     remaining = target_count - existing_count
     batch_size = min(DEFAULT_BATCH, max(10000, remaining // 100))
-    last_report = time.time()
+    last_report_time = time.time()
+    last_report_inserted = 0
+
+    # حد أقصى ديناميكي للدفعات المعلقة لتقليل الضغط على الذاكرة
+    dynamic_max_pending = min(MAX_PENDING_BATCHES, MAX_WORKERS * 2)
 
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             pending = set()
             submitted = 0
             total_batches = (remaining + batch_size - 1) // batch_size
-            
+
             # إرسال الدفعات الأولية
-            for _ in range(min(MAX_PENDING_BATCHES, total_batches)):
+            for _ in range(min(dynamic_max_pending, total_batches)):
                 if submitted >= total_batches:
                     break
                 pending.add(executor.submit(generate_batch, batch_size))
                 submitted += 1
 
             # معالجة الدفعات
-            while (pending or submitted < total_batches) and not active_tasks.get(chat_id, {}).get('cancelled'):
+            while (pending or submitted < total_batches) and not cancel_event.is_set():
                 if not pending and submitted < total_batches:
-                    for _ in range(min(MAX_PENDING_BATCHES, total_batches - submitted)):
+                    for _ in range(min(dynamic_max_pending, total_batches - submitted)):
                         pending.add(executor.submit(generate_batch, batch_size))
                         submitted += 1
-                
+
                 if not pending:
                     break
 
@@ -412,43 +422,70 @@ def generate_parallel(target_count, dbname, tablename, chat_id, context):
                         if batch:
                             inserted = bulk_insert_sessions(dbname, tablename, batch)
                             total_inserted += inserted
-                            
-                            # تحديث التقدم
+
+                            # تحديث التقدم كل 60 ثانية في نفس الرسالة
                             now = time.time()
-                            if now - last_report >= 10 or total_inserted + existing_count >= target_count:
+                            should_report = (now - last_report_time >= 60) or (existing_count + total_inserted >= target_count)
+                            if should_report:
                                 current_total = existing_count + total_inserted
                                 perc = min(100.0, (current_total / target_count) * 100)
-                                speed, elapsed = monitor_performance(start_time, total_inserted)
-                                
-                                context.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"{progress_bar(perc)}\nالتقدم: {current_total}/{target_count}\nالسرعة: {speed:.0f} جلسة/ثانية\nالوقت المنقضي: {elapsed:.0f} ثانية",
-                                    parse_mode="Markdown"
-                                )
-                                last_report = now
-                                
+                                delta_inserted = total_inserted - last_report_inserted
+                                delta_time = now - last_report_time
+                                speed, _ = monitor_performance(delta_inserted, delta_time)
+                                try:
+                                    context.bot.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=progress_message_id,
+                                        text=(
+                                            f"{progress_bar(perc)}\n"
+                                            f"التقدم: {current_total}/{target_count}\n"
+                                            f"السرعة: {speed:.0f} جلسة/ثانية\n"
+                                            f"الوقت المنقضي: {int(now - start_time)} ثانية"
+                                        ),
+                                        parse_mode="Markdown"
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"تعذر تحديث رسالة التقدم: {e}")
+
+                                last_report_time = now
+                                last_report_inserted = total_inserted
+
                     except Exception as e:
                         logger.error(f"خطأ في معالجة الدفعة: {e}")
 
     except Exception as e:
         logger.exception(f"خطأ في generate_parallel: {e}")
-        context.bot.send_message(chat_id=chat_id, text=f"حدث خطأ أثناء التوليد: {e}")
+        try:
+            context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=f"حدث خطأ أثناء التوليد: {e}")
+        except Exception:
+            pass
 
     finally:
-        # الإبلاغ عن النتيجة النهائية
+        # الإبلاغ عن النتيجة النهائية عبر تعديل نفس الرسالة
         final_count = existing_count + total_inserted
         total_time = time.time() - start_time
-        
-        if active_tasks.get(chat_id, {}).get('cancelled'):
-            context.bot.send_message(chat_id=chat_id, text=f"تم إلغاء العملية. تم حفظ {final_count} جلسات.")
-            log_activity("CANCELLED", f"أوقف المستخدم بعد توليد {total_inserted} جلسات")
-        else:
-            context.bot.send_message(
-                chat_id=chat_id, 
-                text=f"✅ انتهى التوليد. تم حفظ {final_count} جلسة في:\nقاعدة البيانات: `{dbname}`\nالجدول: `{tablename}`\nالوقت: {total_time:.0f} ثانية", 
-                parse_mode="Markdown"
-            )
-            log_activity("COMPLETED", f"تم توليد {total_inserted} جلسة في {total_time:.2f} ثانية")
+
+        try:
+            if cancel_event.is_set():
+                context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_message_id,
+                    text=f"تم إلغاء العملية. تم حفظ {final_count} جلسة.")
+                log_activity("CANCELLED", f"أوقف المستخدم بعد توليد {total_inserted} جلسة")
+            else:
+                context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_message_id,
+                    text=(
+                        f"✅ انتهى التوليد. تم حفظ {final_count} جلسة في:\n"
+                        f"قاعدة البيانات: `{dbname}`\nالجدول: `{tablename}`\n"
+                        f"الوقت: {total_time:.0f} ثانية"
+                    ),
+                    parse_mode="Markdown"
+                )
+                log_activity("COMPLETED", f"تم توليد {total_inserted} جلسة في {total_time:.2f} ثانية")
+        except Exception:
+            pass
 
         if chat_id in active_tasks:
             del active_tasks[chat_id]
@@ -513,17 +550,27 @@ def begin_generation(update: Update, context: CallbackContext):
 
     update.message.reply_text(f"سيتم توليد {target} جلسة وحفظها في:\nقاعدة البيانات: `{dbname}`\nالجدول: `{tablename}`\n\nابتدأت العملية الآن...", parse_mode="Markdown")
 
+    # إنشاء رسالة تقدم أولية ليتم تعديلها لاحقاً كل 60 ثانية
+    progress_message = update.message.reply_text("بدء العملية... سيتم تحديث هذه الرسالة كل 60 ثانية.")
+
+    cancel_event = threading.Event()
+
     active_tasks[chat_id] = {
         'start_time': time.time(),
         'target_count': target,
         'dbname': dbname,
         'tablename': tablename,
-        'cancelled': False
+        'cancel_event': cancel_event,
+        'progress_message_id': progress_message.message_id
     }
     log_activity("START_GENERATION", f"الهدف: {target}, قاعدة البيانات: {dbname}, الجدول: {tablename}")
 
     # بدء التوليد في خيط منفصل
-    thread = threading.Thread(target=generate_parallel, args=(target, dbname, tablename, chat_id, context), daemon=True)
+    thread = threading.Thread(
+        target=generate_parallel,
+        args=(target, dbname, tablename, chat_id, context, progress_message.message_id, cancel_event),
+        daemon=True
+    )
     thread.start()
 
     update.message.reply_text("العملية بدأت في الخلفية. ستصلك تحديثات تقدّم من حين لآخر. لإلغاء العملية أرسل /cancel.")
@@ -533,7 +580,7 @@ def begin_generation(update: Update, context: CallbackContext):
 def cancel(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     if chat_id in active_tasks:
-        active_tasks[chat_id]['cancelled'] = True
+        active_tasks[chat_id]['cancel_event'].set()
         log_activity("CANCEL_REQUEST", "طلب إلغاء المهمة")
         update.message.reply_text("تم إرسال أمر الإلغاء، جاري إيقاف العملية...")
     else:
@@ -601,7 +648,7 @@ def alert_check(context: CallbackContext):
 # نقطة الدخول
 # ----------------------
 def main():
-    BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
     # التحقق من الإعدادات
     if BOT_OWNER_ID == 123456789:
@@ -610,6 +657,10 @@ def main():
 
     if POSTGRES_CONFIG["password"] == "your_password":
         logger.error("❗ لم تقم بتعيين كلمة مرور PostgreSQL الصحيحة")
+        return
+
+    if not BOT_TOKEN:
+        logger.error("❗ لم تقم بتعيين متغير البيئة BOT_TOKEN")
         return
 
     updater = Updater(BOT_TOKEN, use_context=True)
@@ -630,7 +681,7 @@ def main():
     dp.add_handler(CommandHandler('cancel', cancel))
     dp.add_handler(CommandHandler('status', status))
     dp.add_handler(CommandHandler('dashboard', dashboard))
-    dp.add_handler(CommandHandler('start', start))
+    # تمت إضافة /start كمدخل في ConversationHandler أعلاه، لا داعي لإضافته مرة أخرى
 
     job_queue.run_repeating(alert_check, interval=1800, first=0)
 
