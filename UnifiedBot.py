@@ -280,20 +280,8 @@ def handle_checker_mode(query, context, session_type):
         query.edit_message_text("❌ مكتبة Pyrogram غير مثبتة. يرجى تثبيتها أولاً.")
         return ConversationHandler.END
     
-    # التحقق من وجود بوتات فحص
+    # لم يعد وجود بوتات الفحص شرطاً للبدء بعد تعديل منطق الفحص
     checking_bots = checker.get_checking_bots()
-    if not checking_bots:
-        query.edit_message_text(
-            "⚠️ **لا توجد بوتات فحص مضافة!**\n\n"
-            "يجب إضافة بوت فحص واحد على الأقل قبل البدء.\n"
-            "استخدم 'إدارة بوتات الفحص' لإضافة بوت.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🤖 إضافة بوت فحص", callback_data="manage_bots")],
-                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-            ])
-        )
-        return ASK_MODE
     
     query.edit_message_text(
         f"🔍 **فحص جلسات {session_type.title()}**\n\n"
@@ -301,7 +289,6 @@ def handle_checker_mode(query, context, session_type):
         f"ستصلك الجلسات الصالحة في رسائل منفصلة.\n\n"
         f"🤖 بوتات الفحص المتاحة: {len(checking_bots)}\n\n"
         f"هل تريد البدء؟",
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ ابدأ الآن", callback_data=f"action_start_check_{session_type}")],
             [InlineKeyboardButton("❌ إلغاء", callback_data="cancel")]
@@ -315,24 +302,14 @@ def handle_file_check_mode(query, context):
         query.edit_message_text("❌ وحدة فحص الجلسات غير متاحة.")
         return ConversationHandler.END
     
-    # التحقق من وجود بوتات فحص
+    # لم يعد وجود بوتات الفحص شرطاً لفحص الملفات
     checking_bots = checker.get_checking_bots()
-    if not checking_bots:
-        query.edit_message_text(
-            "⚠️ لا توجد بوتات فحص مضافة! يجب إضافة بوت فحص أولاً.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🤖 إضافة بوت فحص", callback_data="manage_bots")],
-                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-            ])
-        )
-        return ASK_MODE
     
     query.edit_message_text(
         "📁 **فحص ملف الجلسات**\n\n"
         "أرسل مسار الملف الذي يحتوي على الجلسات المراد فحصها.\n"
         "يجب أن يكون كل سطر يحتوي على جلسة واحدة.\n\n"
-        "مثال: `/home/user/sessions.txt`",
-        parse_mode="Markdown"
+        "مثال: `/home/user/sessions.txt`"
     )
     return ASK_FILE_PATH
 
@@ -364,7 +341,6 @@ def handle_bot_management(query, context):
     query.edit_message_text(
         f"🤖 **إدارة بوتات الفحص**\n\n"
         f"البوتات المضافة ({len(checking_bots)}):\n{bots_list}",
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return ASK_MODE
@@ -421,7 +397,6 @@ def handle_unified_dashboard(query, context):
         f"💾 **إحصائيات Tolid:**\n{tolid_info}\n\n"
         f"🔍 **إحصائيات Checker:**\n{checker_info}\n\n"
         f"📝 **آخر الأنشطة:**\n{recent_activities}",
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 تحديث", callback_data="dashboard")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
@@ -437,8 +412,7 @@ def handle_action_buttons(query, context):
         query.edit_message_text(
             "🤖 **إضافة بوت فحص جديد**\n\n"
             "أرسل توكن البوت الذي تريد إضافته:\n"
-            "مثال: `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`",
-            parse_mode="Markdown"
+            "مثال: `123456789:ABCdefGHIjklMNOpqrSTUvwxYZ`"
         )
         return ADD_BOT_TOKEN
     
@@ -833,7 +807,6 @@ def handle_file_management(query, context):
             f"• {', '.join(SUPPORTED_FILE_EXTENSIONS)}\n\n"
             "ضع ملفات الجلسات في المجلد الحالي أو في:\n"
             f"`{DEFAULT_FILES_DIRECTORY}`",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
             ])
@@ -870,11 +843,6 @@ def handle_file_management(query, context):
         f"📂 **إدارة الملفات المحفوظة** ({len(session_files)} ملف)\n\n"
         f"{files_text}"
         f"💡 يمكنك فحص أو حذف أي ملف من القائمة أعلاه.",
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return ASK_MODE
-
-
-
-# ----------------------
