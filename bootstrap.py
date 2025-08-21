@@ -1,17 +1,29 @@
 import os
 import sys
+import site
 import subprocess
 import time
 import traceback
 
 
 REQUIRED_PACKAGES = [
+    "urllib3<2",  # متوافق مع python-telegram-bot 13.x
     "python-telegram-bot==13.15",
     "psycopg2-binary",
     "telethon>=1.24.0", 
     "pyrogram>=2.0.0",
     "requests>=2.28.0",
 ]
+
+
+def _ensure_user_site_on_path() -> None:
+    """أضف user site-packages إلى sys.path لضمان رؤية الحزم المثبتة بـ --user."""
+    try:
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str) and user_site and user_site not in sys.path:
+            sys.path.append(user_site)
+    except Exception:
+        pass
 
 
 def run(cmd: list[str]) -> int:
@@ -24,20 +36,28 @@ def run(cmd: list[str]) -> int:
 
 def ensure_packages() -> None:
     python_exe = sys.executable
+    _ensure_user_site_on_path()
 
     # Upgrade pip/setuptools/wheel first for better compatibility
     print("[bootstrap] تحديث pip وأدوات التثبيت...")
-    run([python_exe, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    # استخدم --break-system-packages لتجاوز بيئات PEP 668 المُدارة خارجيًا عند الحاجة
+    run([
+        python_exe, "-m", "pip", "install", "--upgrade",
+        "pip", "setuptools", "wheel", "--break-system-packages"
+    ])
 
     # Install required runtime packages
     print("[bootstrap] تثبيت المتطلبات...")
-    install_cmd = [python_exe, "-m", "pip", "install", "--no-input"] + REQUIRED_PACKAGES
+    install_cmd = [
+        python_exe, "-m", "pip", "install", "--no-input", "--break-system-packages"
+    ] + REQUIRED_PACKAGES
     code = run(install_cmd)
     if code != 0:
         print("[bootstrap] فشل تثبيت المتطلبات عبر pip", file=sys.stderr)
         sys.exit(1)
 
     # تحقق صريح من أن الوحدات أصبحت متاحة
+    _ensure_user_site_on_path()
     try:
         import telegram  # noqa: F401
         print("[bootstrap] ✅ python-telegram-bot متاح")
