@@ -280,20 +280,8 @@ def handle_checker_mode(query, context, session_type):
         query.edit_message_text("❌ مكتبة Pyrogram غير مثبتة. يرجى تثبيتها أولاً.")
         return ConversationHandler.END
     
-    # التحقق من وجود بوتات فحص
+    # لم يعد وجود بوتات الفحص شرطاً للبدء بعد تعديل منطق الفحص
     checking_bots = checker.get_checking_bots()
-    if not checking_bots:
-        query.edit_message_text(
-            "⚠️ **لا توجد بوتات فحص مضافة!**\n\n"
-            "يجب إضافة بوت فحص واحد على الأقل قبل البدء.\n"
-            "استخدم 'إدارة بوتات الفحص' لإضافة بوت.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🤖 إضافة بوت فحص", callback_data="manage_bots")],
-                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-            ])
-        )
-        return ASK_MODE
     
     query.edit_message_text(
         f"🔍 **فحص جلسات {session_type.title()}**\n\n"
@@ -315,17 +303,8 @@ def handle_file_check_mode(query, context):
         query.edit_message_text("❌ وحدة فحص الجلسات غير متاحة.")
         return ConversationHandler.END
     
-    # التحقق من وجود بوتات فحص
+    # لم يعد وجود بوتات الفحص شرطاً لفحص الملفات
     checking_bots = checker.get_checking_bots()
-    if not checking_bots:
-        query.edit_message_text(
-            "⚠️ لا توجد بوتات فحص مضافة! يجب إضافة بوت فحص أولاً.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🤖 إضافة بوت فحص", callback_data="manage_bots")],
-                [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-            ])
-        )
-        return ASK_MODE
     
     query.edit_message_text(
         "📁 **فحص ملف الجلسات**\n\n"
